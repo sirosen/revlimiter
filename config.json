@@ -6,18 +6,15 @@
   "routes": {
     "/": {
       "fill_rate": 1,
-      "bucket_max": 10,
-      "bucket_start": 10
+      "bucket_max": 10
     },
     "/lenient": {
-      "fill_rate": 2,
-      "bucket_max": 20,
-      "bucket_start": 20
+      "fill_rate": 3,
+      "bucket_max": 20
     },
     "/superburst": {
-      "fill_rate": 50,
-      "bucket_max": 3,
-      "bucket_start": 3
+      "fill_rate": 10,
+      "bucket_max": 100
     }
   }
 }

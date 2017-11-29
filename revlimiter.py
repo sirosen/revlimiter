@@ -26,7 +26,7 @@ class Throttler(object):
     __slots__ = ['_resource_buckets',
                  '_fill_rate', '_bucket_max', '_bucket_start']
 
-    def __init__(self, fill_rate, bucket_max, bucket_start):
+    def __init__(self, fill_rate, bucket_max):
         """
         The main attribute of a Throttler is a set of data buckets for
         different throttleable resources.
@@ -38,8 +38,10 @@ class Throttler(object):
         self._fill_rate = fill_rate
         # bucket max is maximum number of tokens a requester can accrue
         self._bucket_max = bucket_max
-        # bucket start is the number of tokens each bucket starts with
-        self._bucket_start = bucket_start
+        # bucket start is the number of tokens each bucket starts with -- for
+        # our case, let's just set it to the bucket max, which keeps things
+        # simpler
+        self._bucket_start = bucket_max
 
     def _get_item(self, resource_id, requester_id, now):
         """
@@ -190,10 +192,8 @@ def make_tornado_app(config):
     return tornado.web.Application([
         (path,
          ThrottleTornadoHandler,
-         {'throttler': Throttler(routeconf['fill_rate'],
-                                 routeconf['bucket_max'],
-                                 routeconf['bucket_start'])
-          }
+         {'throttler':
+          Throttler(routeconf['fill_rate'], routeconf['bucket_max'])}
          )
         for path, routeconf in routes.items()
     ])
