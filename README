@@ -1,0 +1,8 @@
+Simple Rate Limiting Using Python's Tornado Framework
+
+- Token bucket algorithm
+- HTTP Interface
+- Configuration maps routes to token-bucket parameters
+- Minimal dependencies (Tornado + stdlib)
+- ~1.5ms response time using in-memory storage
+- Run as a separate daemon process for good separation of concerns
