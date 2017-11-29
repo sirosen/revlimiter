@@ -1,12 +1,16 @@
+#!/usr/bin/env python3
+
 import sys
 import time
 import json
 
+import tornado.gen
 import tornado.escape
 import tornado.httpserver
 import tornado.ioloop
 import tornado.netutil
 import tornado.web
+import tornado.locks
 
 
 class Throttler(object):
@@ -23,7 +27,8 @@ class Throttler(object):
     input event that may or may not be throttled and returns a data dict with
     info about whether or not to throttle the request.
     """
-    __slots__ = ['_resource_buckets',
+    __slots__ = ['_writer_lock',
+                 '_resource_buckets',
                  '_fill_rate', '_bucket_max', '_bucket_start']
 
     def __init__(self, fill_rate, bucket_max):
@@ -32,6 +37,10 @@ class Throttler(object):
         different throttleable resources.
         """
         self._resource_buckets = {}
+
+        # NOTE: this is a tornado lock, so it's not threadsafe -- it
+        # coordinates Tornado coroutines
+        self._writer_lock = tornado.locks.Lock()
 
         # Token Bucket algorithm params
         # fill rate is num tokens gained per second
@@ -83,6 +92,7 @@ class Throttler(object):
         item['num_tokens'] = min(self._bucket_max, num_tokens + delta)
         item['last_access'] = now
 
+    @tornado.gen.coroutine
     def _consume_token(self, resource_id, requester_id, now):
         """
         Get and update an item, then attempt to consume a token from that item.
@@ -92,17 +102,21 @@ class Throttler(object):
         insufficient capacity for a token to be consumed (meaning that the
         request should probably be throttled).
         """
+        yield self._writer_lock.acquire()
         item = self._get_item(resource_id, requester_id, now)
         self._update_item(item, now)
 
         new_val = item['num_tokens'] - 1
         if new_val < 0:
-            return False
+            ret = False
         else:
             item['num_tokens'] = new_val
-            return True
+            ret = True
+        yield self._writer_lock.release()
+        return ret
 
-    def handle_event(self, event):
+    @tornado.gen.coroutine
+    def handle_event(self, event, callback):
         '''
         Events are throttle requests -- json data of the following format:
 
@@ -148,13 +162,15 @@ class Throttler(object):
 
         # add tokens based on time elapsed, update last access time, and
         # attempt to remove a token (if possible)
-        has_capacity = self._consume_token(requester_id, resource_id, now)
+        has_capacity = yield self._consume_token(
+            requester_id, resource_id, now)
 
         if has_capacity:
-            return {'allow_request': True, 'denial_details': None}
+            result = {'allow_request': True, 'denial_details': None}
         else:
-            return {'allow_request': False,
-                    'denial_details': 'No detail today!'}
+            result = {'allow_request': False,
+                      'denial_details': 'No detail today!'}
+        callback(result)
 
 
 class ThrottleTornadoHandler(tornado.web.RequestHandler):
@@ -173,13 +189,18 @@ class ThrottleTornadoHandler(tornado.web.RequestHandler):
         """
         self.throttler = throttler
 
+    def _got_result(self, return_message):
+        self.write(return_message)
+        self.finish()
+
+    @tornado.web.asynchronous
     def post(self):
         """
         Handle POST /
         Runs on every request.
         """
         request = tornado.escape.json_decode(self.request.body)
-        self.write(self.throttler.handle_event(request))
+        self.throttler.handle_event(request, self._got_result)
 
 
 def make_tornado_app(config):

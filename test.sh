@@ -1,9 +1,12 @@
 #!/bin/bash
 
-[[ -d .venv ]] || virtualenv .venv
+[[ -d .venv ]] || (virtualenv --python python3 .venv &&
+                   .venv/bin/pip install -r requirements.txt &&
+                   .venv/bin/pip install flake8)
 source .venv/bin/activate
+flake8 revlimiter.py
 
-pip install -r requirements.txt
+TIMEFORMAT=$'\n%3R'
 
 # make sure we cleanup this background job when we're done
 trap 'kill $(jobs -p)' EXIT
@@ -13,10 +16,18 @@ python revlimiter.py > revlimiter.log 2>&1 &
 sleep 1
 
 echo -n "time of a single regular call: "
-/usr/bin/time -f '\n%e' curl -s -XPOST 'localhost:8888/' -d '{"requester_id": "foouser", "resource_id": "barresource"}'
+time curl -s -XPOST 'localhost:8888/' -d '{"requester_id": "foouser", "resource_id": "barresource"}'
 
 echo -n "time of a single lenient call: "
-/usr/bin/time -f '\n%e' curl -s -XPOST 'localhost:8888/lenient' -d '{"requester_id": "foouser", "resource_id": "barresource"}'
+time curl -s -XPOST 'localhost:8888/lenient' -d '{"requester_id": "foouser", "resource_id": "barresource"}'
+
+run_1000 () {
+    for i in {0..1000}; do
+        curl -s -XPOST 'localhost:8888/lenient' -d '{"requester_id": "foouser", "resource_id": "barresource"}' > /dev/null
+    done
+}
+echo -n "time of 1000 calls:"
+time run_1000
 
 echo -e "\nmake calls until failure\n"
 echo "regular:"
