@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
 
 import sys
+import os
+import subprocess
 import time
 import json
 
-import tornado.gen
-import tornado.escape
-import tornado.httpserver
-import tornado.ioloop
-import tornado.netutil
-import tornado.web
-import tornado.locks
+import aiohttp.web
+import asyncio
+
+
+def getmem(unit=None):
+    """use ps command to easily and reliably get mem info
+    not very performant"""
+    div = {
+        'KB': 1,
+        'MB': 1024
+    }.get(unit, 1)
+    lines = subprocess.run(['ps', 'v', '-p', str(os.getpid())],
+                           stdout=subprocess.PIPE, check=True
+                           ).stdout.split(b'\n')
+    headers, content = lines[0].split(), lines[1].split()
+    return int(float(content[headers.index(b'RSS')]) / div)
 
 
 class Throttler(object):
@@ -23,12 +34,11 @@ class Throttler(object):
     to no impact on the pure memory version.
 
     The only method you should need (other than the constructor) is
-    `Throttler.handle_event` which consumes a dictionary representing some
+    `Throttler.handle_request` which consumes a request representing some
     input event that may or may not be throttled and returns a data dict with
     info about whether or not to throttle the request.
     """
-    __slots__ = ['_writer_lock',
-                 '_resource_buckets',
+    __slots__ = ['_resource_buckets', '_writer_lock',
                  '_fill_rate', '_bucket_max', '_bucket_start']
 
     def __init__(self, fill_rate, bucket_max):
@@ -38,9 +48,8 @@ class Throttler(object):
         """
         self._resource_buckets = {}
 
-        # NOTE: this is a tornado lock, so it's not threadsafe -- it
-        # coordinates Tornado coroutines
-        self._writer_lock = tornado.locks.Lock()
+        # a lock to protect writes
+        self._writer_lock = asyncio.Lock()
 
         # Token Bucket algorithm params
         # fill rate is num tokens gained per second
@@ -51,6 +60,10 @@ class Throttler(object):
         # our case, let's just set it to the bucket max, which keeps things
         # simpler
         self._bucket_start = bucket_max
+
+        print('Creating throttler[{}](fill_rate={}, max={})'
+              .format(id(self), fill_rate, bucket_max),
+              file=sys.stderr)
 
     def _get_item(self, resource_id, requester_id, now):
         """
@@ -92,8 +105,7 @@ class Throttler(object):
         item['num_tokens'] = min(self._bucket_max, num_tokens + delta)
         item['last_access'] = now
 
-    @tornado.gen.coroutine
-    def _consume_token(self, resource_id, requester_id, now):
+    async def _consume_token(self, resource_id, requester_id, now):
         """
         Get and update an item, then attempt to consume a token from that item.
         An item is a token bucket for a resource ID + requester ID.
@@ -102,21 +114,49 @@ class Throttler(object):
         insufficient capacity for a token to be consumed (meaning that the
         request should probably be throttled).
         """
-        yield self._writer_lock.acquire()
-        item = self._get_item(resource_id, requester_id, now)
-        self._update_item(item, now)
+        with await self._writer_lock:
+            item = self._get_item(resource_id, requester_id, now)
+            self._update_item(item, now)
 
-        new_val = item['num_tokens'] - 1
-        if new_val < 0:
-            ret = False
-        else:
-            item['num_tokens'] = new_val
-            ret = True
-        yield self._writer_lock.release()
-        return ret
+            new_val = item['num_tokens'] - 1
+            if new_val < 0:
+                return False
+            else:
+                item['num_tokens'] = new_val
+                return True
 
-    @tornado.gen.coroutine
-    def handle_event(self, event, callback):
+    async def periodic_clean(self, app):
+        """
+        An async looping task which does a sweep of self._resource_buckets
+        every N seconds.
+
+        This is done in a two-phase procedure -- mark and sweep.
+        """
+        async def _clean_helper(seconds):
+            while True:
+                await asyncio.sleep(seconds)
+                now = time.time()
+
+                swept = 0
+                with await self._writer_lock:
+                    for resource_id, bucket in self._resource_buckets.items():
+                        # MARK
+                        marked = set()
+                        for requester, item in bucket.items():
+                                self._update_item(item, now)
+                                if item['num_tokens'] >= self._bucket_max:
+                                    marked.add(requester)
+                        # SWEEP
+                        if marked:
+                            for requester in marked:
+                                bucket.pop(requester, None)
+                                swept += 1
+                print('throttler[{}] Periodic cleanup got {} items'
+                      .format(id(self), swept), file=sys.stderr)
+
+        app.loop.create_task(_clean_helper(30))
+
+    async def handle_request(self, request):
         '''
         Events are throttle requests -- json data of the following format:
 
@@ -139,7 +179,7 @@ class Throttler(object):
             to the developer using revlimiter
           - throttle_params: Arbitrary bucket of params to the throttler.
 
-        handle_event() consumes an event, finds its token bucket, attempts to
+        handle_request() consumes an event, finds its token bucket, attempts to
         spend a token from that bucket, and then returns a datadict with two
         keys:
 
@@ -148,6 +188,8 @@ class Throttler(object):
           - denial_details: A string or null. Contains any message from the
             throttler back to the requester.
         '''
+        event = await request.json()
+
         requester_id = event['requester_id']
         resource_id = event['resource_id']
         try:
@@ -162,87 +204,59 @@ class Throttler(object):
 
         # add tokens based on time elapsed, update last access time, and
         # attempt to remove a token (if possible)
-        has_capacity = yield self._consume_token(
+        has_capacity = await self._consume_token(
             requester_id, resource_id, now)
 
         if has_capacity:
-            result = {'allow_request': True, 'denial_details': None}
+            response = {'allow_request': True, 'denial_details': None}
         else:
-            result = {'allow_request': False,
-                      'denial_details': 'No detail today!'}
-        callback(result)
+            response = {'allow_request': False,
+                        'denial_details': 'No detail today!'}
+
+        return aiohttp.web.Response(text=json.dumps(response))
 
 
-class ThrottleTornadoHandler(tornado.web.RequestHandler):
+async def periodic_stats(app):
     """
-    This is a Tornado web request handler for requests
-    It is initialized with a throttler object to track state.
-
-    Only accepts POST requests, which must send a requester ID and a resource
-    ID encoded in a JSON body. The request is decoded and passed to the
-    throttler's handle_event method.
-    The results of that call are written back to the caller verbatim.
+    Collect and print stats info to stderr
     """
-    def initialize(self, throttler):
-        """
-        Setup the handler. Only runs once per Tornado Server.
-        """
-        self.throttler = throttler
+    async def _stats_helper(seconds):
+        while True:
+            await asyncio.sleep(seconds)
+            print('[stats] Using {}KB of RSS memory'.format(getmem()),
+                  file=sys.stderr)
 
-    def _got_result(self, return_message):
-        self.write(return_message)
-        self.finish()
-
-    @tornado.web.asynchronous
-    def post(self):
-        """
-        Handle POST /
-        Runs on every request.
-        """
-        request = tornado.escape.json_decode(self.request.body)
-        self.throttler.handle_event(request, self._got_result)
+    app.loop.create_task(_stats_helper(60))
 
 
-def make_tornado_app(config):
-    """
-    Given throttler config, create a Tornado application with its routes
-    mapped to various handlers.
-    """
-    routes = config['routes']
+def setup_routes(app, config):
+    for path, routeconf in config['routes'].items():
+        throttler = Throttler(routeconf['fill_rate'], routeconf['bucket_max'])
 
-    return tornado.web.Application([
-        (path,
-         ThrottleTornadoHandler,
-         {'throttler':
-          Throttler(routeconf['fill_rate'], routeconf['bucket_max'])}
-         )
-        for path, routeconf in routes.items()
-    ])
+        app.router.add_post(path, throttler.handle_request)
+
+        app.on_startup.append(throttler.periodic_clean)
+
+    app.on_startup.append(periodic_stats)
 
 
 def run(config):
     """
     Does these steps:
-    - make a Tornado HTTP Server (synchronous) from config
-    - bind to a unix socket or a port
-    - start Tornado listening
+    - make an aiohttp HTTP Server
+    - attach routes
+    - bind to a port or unix socket and start handling events
     """
-    server = tornado.httpserver.HTTPServer(make_tornado_app(config))
-
+    app = aiohttp.web.Application()
+    setup_routes(app, config)
     sockconf = config['socket']
-    # if in unix mode, bind a unix socket
     if sockconf['mode'] == 'unix':
-        unix_socket = tornado.netutil.bind_unix_socket(sockconf['path'])
-        server.add_socket(unix_socket)
-    # if in net mode, bind to the given port num
+        aiohttp.web.run_app(app, path=sockconf['path'])
     elif sockconf['mode'] == 'net':
-        norm_sockets = tornado.netutil.bind_sockets(sockconf['port'])
-        server.add_sockets(norm_sockets)
+        aiohttp.web.run_app(app, port=sockconf['port'])
     # otherwise, we were given a back sock_mode
     else:
         raise ValueError('Invalid sock_mode: {}'.format(sockconf['mode']))
-
-    tornado.ioloop.IOLoop.instance().start()
 
 
 def main():

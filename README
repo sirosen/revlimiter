@@ -1,8 +1,9 @@
-Simple Rate Limiting Using Python's Tornado Framework
+Simple Rate Limiting Using Python3's AsyncIO
+(python >= 3.5)
 
 - Token bucket algorithm
 - HTTP Interface
 - Configuration maps routes to token-bucket parameters
-- Minimal dependencies (Tornado + stdlib)
-- ~1.5ms response time using in-memory storage
+- Minimal dependencies (aiohttp + stdlib)
+- Throttler has 0.7ms-3ms response time using in-memory storage
 - Run as a separate daemon process for good separation of concerns
